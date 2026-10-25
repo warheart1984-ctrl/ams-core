@@ -61,6 +61,15 @@ export class PlaybackEngine {
   /** Count of drift excursions beyond tolerance. */
   private driftViolations = 0;
   private lastCueCrossfade: { from: string; to: string; startedAtSample: number; durationSamples: number } | null = null;
+  /** Called when a dispatched CUE_SWITCH reaches its audible position. Wired to the logic layer. */
+  onCueStarted?: (cueId: string, atSample: number) => void;
+  /** Called when a dispatched crossfade completes. Wired to the logic layer. */
+  onTransitionEnded?: (fromCueId: string, toCueId: string, elapsedMs: number) => void;
+  /** CUE_SWITCHes handed to the adapter but not yet audible (atSample in the future). */
+  private dispatchedSwitches: { cueId: string; fromCueId: string; atSample: number; crossfadeMs: number }[] = [];
+  /** Audible cue switches whose crossfade has not yet completed. */
+  private pendingTransitionEnds: { fromCueId: string; toCueId: string; endSample: number; crossfadeMs: number }[] = [];
+  private lastAudibleCueId = "";
 
   constructor(adapter: PlaybackAdapter, config: PlaybackEngineConfig) {
     if (![44100, 48000].includes(config.sampleRate)) {
@@ -176,8 +185,11 @@ export class PlaybackEngine {
     // Advance logical clock
     this.clock.advance(BigInt(Math.max(0, delta)));
 
-    // Report drift to the clock for recovery
-    const logical = this.currentSample;
+    // The logical position is the clock's, not a second tracker that was
+    // never updated (a constant 0 made every tick report a drift violation
+    // and fed runaway corrections into recoverDrift).
+    const logical = this.clock.snapshot().sample.samples;
+    this.currentSample = logical;
     const drift = outputSample - logical;
     const toleranceSamples = Math.ceil(this.config.sampleRate * 0.001); // 1 ms
     if (Math.abs(drift) > toleranceSamples) {
@@ -194,28 +206,25 @@ export class PlaybackEngine {
     const lookaheadSamples = Math.floor((this.config.lookaheadMs / 1000) * this.config.sampleRate);
     const horizon = outputSample + lookaheadSamples;
 
-    // Dispatch due instructions (those whose atSample ≤ horizon OR are IMMEDIATE)
+    // Dispatch instructions to the adapter. Past-due and IMMEDIATE entries
+    // dispatch now; future entries inside the lookahead horizon are handed
+    // over for sample-accurate firing. (Previously due instructions were
+    // collected into a list nobody read and silently dropped.)
     let index = 0;
-    const toDispatch: PendingInstruction[] = [];
     while (index < this.scheduleQueue.length) {
       const entry = this.scheduleQueue[index];
-      // Immediate instructions dispatch right away
-      if (entry.instruction.immediately || entry.atSample <= currentSampleForDispatch()) {
-        toDispatch.push(entry);
-        this.scheduleQueue.splice(index, 1);
-      } else if (entry.atSample <= horizon) {
-        // Schedule ahead of time — hand to the adapter for sample-accurate firing
+      if (entry.instruction.immediately || entry.atSample <= horizon) {
         this.adapter.schedule(entry.instruction);
-        toDispatch.push(entry); // still counted as dispatched to adapter
+        this.noteDispatched(entry.instruction);
         this.scheduleQueue.splice(index, 1);
       } else {
         index++;
       }
     }
 
-    function currentSampleForDispatch(): number {
-      return outputSample;
-    }
+    // Promote dispatched cue switches whose audible position has arrived,
+    // then report any crossfades that completed.
+    this.promoteDispatched(outputSample);
 
     // Fire grid events (beat/bar) based on new logical position
     this.fireGridEventsFromOutput(outputSample);
@@ -326,9 +335,48 @@ export class PlaybackEngine {
 
   private checkCompletedCrossfades(outputSample: number): void {
     void outputSample;
-    // Crossfade completion is tracked by adapter callbacks in production.
-    // This method exists as an extension point for adapters that cannot
-    // provide callbacks, in which case the engine times them out here.
+    // Crossfade completion is handled in promoteDispatched: pending entries
+    // fire onTransitionEnded once output passes their scheduled end.
+  }
+
+  /** Track a dispatched CUE_SWITCH so its audible start/end can be reported. */
+  private noteDispatched(instruction: PlaybackInstruction): void {
+    if (instruction.type === "CUE_SWITCH" && instruction.targetCueId) {
+      this.dispatchedSwitches.push({
+        cueId: instruction.targetCueId,
+        fromCueId: this.lastAudibleCueId,
+        atSample: instruction.atSample,
+        crossfadeMs: instruction.crossfadeMs ?? 0,
+      });
+      this.dispatchedSwitches.sort((a, b) => a.atSample - b.atSample);
+    }
+  }
+
+  /**
+   * Report audible cue starts and completed transitions to the logic layer.
+   * A switch counts as started once output passes its scheduled position;
+   * its transition ends once output passes position + crossfade duration.
+   */
+  private promoteDispatched(outputSample: number): void {
+    while (this.dispatchedSwitches.length > 0 && this.dispatchedSwitches[0].atSample <= outputSample) {
+      const sw = this.dispatchedSwitches.shift()!;
+      this.lastAudibleCueId = sw.cueId;
+      this.onCueStarted?.(sw.cueId, sw.atSample);
+      if (sw.crossfadeMs > 0) {
+        this.pendingTransitionEnds.push({
+          fromCueId: sw.fromCueId,
+          toCueId: sw.cueId,
+          endSample: sw.atSample + (sw.crossfadeMs / 1000) * this.config.sampleRate,
+          crossfadeMs: sw.crossfadeMs,
+        });
+      } else {
+        this.onTransitionEnded?.(sw.fromCueId, sw.cueId, 0);
+      }
+    }
+    while (this.pendingTransitionEnds.length > 0 && this.pendingTransitionEnds[0].endSample <= outputSample) {
+      const end = this.pendingTransitionEnds.shift()!;
+      this.onTransitionEnded?.(end.fromCueId, end.toCueId, end.crossfadeMs);
+    }
   }
 
   private emitError(code: string, message: string, recoverable: boolean, context?: Record<string, unknown>): void {

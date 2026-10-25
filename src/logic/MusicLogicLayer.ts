@@ -106,6 +106,32 @@ export class MusicLogicLayer {
     }
   }
 
+  /** Remove cues previously loaded from a bank (RFC §13.1 unload cleanup). */
+  unloadCues(cueIds: string[]): void {
+    for (const id of cueIds) {
+      this.cues.delete(id);
+    }
+    if (this.activeCueId && cueIds.includes(this.activeCueId)) {
+      this.activeCueId = null;
+    }
+  }
+
+  /** Remove stingers previously loaded from a bank. */
+  unloadStingers(stingerIds: string[]): void {
+    for (const id of stingerIds) {
+      this.stingers.delete(id);
+    }
+  }
+
+  /** Drop a state's default-cue mapping (bank unload cleanup). */
+  unregisterStateDefaultCue(stateName: string): void {
+    this.stateDefaultCues.delete(stateName);
+  }
+
+  getSegmentEndSample(): number | null {
+    return this.currentSegmentEndSample;
+  }
+
   // ─── State Handling ────────────────────────────────────────────
 
   /**
@@ -114,7 +140,6 @@ export class MusicLogicLayer {
    */
   handleStateChange(prevState: string | null, newState: string): void {
     const descriptor = this.matrix.lookup(prevState ?? "", newState);
-    this.activeState = newState;
 
     if (!descriptor) {
       this.emitError(
@@ -188,6 +213,8 @@ export class MusicLogicLayer {
       return;
     }
 
+    // Guards passed — only now does the state actually change.
+    this.activeState = newState;
     this.scheduleTransition(descriptor, prevState, newState, targetCueId);
   }
 
@@ -228,7 +255,23 @@ export class MusicLogicLayer {
 
     const crossfadeMs = descriptor.crossfadeMs ?? 0;
 
-    // Stinger scheduling (must not precede the grid boundary)
+    // Interruptibility check — the in-flight transition's `interruptible`
+    // flag decides, not the incoming descriptor's. A lower-priority incoming
+    // transition cannot supersede a non-interruptible in-flight one.
+    if (this.transitionInProgress && this.transitionInProgress.descriptor.interruptible === false) {
+      if ((descriptor.priority ?? 0) < (this.transitionInProgress.descriptor.priority ?? 0)) {
+        this.emitError(
+          ErrorCodes.TRANSITION_FAILED,
+          `Transition (${fromState ?? "start"} → ${toState}) superseded: existing transition has higher priority`,
+          true
+        );
+        return;
+      }
+    }
+
+    // Stinger scheduling — only after the transition is accepted, so a
+    // rejected transition never plays its stinger. (Must not precede the
+    // grid boundary.)
     if (descriptor.stingerId) {
       const stinger = this.stingers.get(descriptor.stingerId);
       if (!stinger) {
@@ -246,20 +289,6 @@ export class MusicLogicLayer {
           stingerId: descriptor.stingerId,
           stingerVolume: descriptor.stingerVolume ?? stinger.mixVolume ?? 1.0,
         });
-      }
-    }
-
-    // Interruptibility check — if a transition is in progress and this new
-    // one is lower priority / non-interrupting, reject.
-    if (this.transitionInProgress && descriptor.interruptible === false && this.transitionInProgress.descriptor.priority !== undefined) {
-      // If new descriptor has lower priority than the in-flight one, hold off.
-      if ((descriptor.priority ?? 0) < (this.transitionInProgress.descriptor.priority ?? 0)) {
-        this.emitError(
-          ErrorCodes.TRANSITION_FAILED,
-          `Transition (${fromState ?? "start"} → ${toState}) superseded: existing transition has higher priority`,
-          true
-        );
-        return;
       }
     }
 

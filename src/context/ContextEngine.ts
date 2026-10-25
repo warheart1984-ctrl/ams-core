@@ -114,6 +114,15 @@ export class ContextEngine {
     }
   }
 
+  unregisterRtpc(name: string): void {
+    this.rtpcs.delete(name);
+    this.rtpcCurrentRaw.delete(name);
+    this.rtpcCurrentSmoothed.delete(name);
+    this.rtpcTarget.delete(name);
+    this.rtpcRampMs.delete(name);
+    this.rtpcLastUpdateNs.delete(name);
+  }
+
   // ─── RTPC Registration ─────────────────────────────────────────
 
   registerRtpc(def: RTPCDefinition): void {

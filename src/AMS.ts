@@ -113,6 +113,16 @@ export class AMS {
       config: { queueTtlMs: 0 },
     });
 
+    // Wire the engine's audible-position callbacks back to the logic layer:
+    // cue_changed / transition_end / RTPC stem mapping / cooldowns / bank
+    // activity all depend on these firing.
+    this.playbackEngine.onCueStarted = (cueId) => {
+      this.logicLayer.onCueChanged(this.logicLayer.getActiveCueId(), cueId, this.logicLayer.getActiveState() ?? "");
+    };
+    this.playbackEngine.onTransitionEnded = (from, to, elapsedMs) => {
+      this.logicLayer.onTransitionEnded(from, to, elapsedMs);
+    };
+
     // Wire context engine to logic layer
     this.contextEngine.on("state", (e) => {
       if (e.kind === "accepted" || e.kind === "preempted" || e.kind === "cancelled") {
@@ -282,6 +292,8 @@ export class AMS {
     if (!loader) {
       throw new AMSError(ErrorCodes.BANK_LOAD_FAILED, "A cue bank loader must be provided (FS/HTTP/URL adapter)", false);
     }
+    // A failed or slow load must not brick the engine or drop "playing".
+    const priorLifecycle = this.lifecycle === "uninitialized" || this.lifecycle === "error" ? "ready" : this.lifecycle;
     this.lifecycle = "loading";
     try {
       const { manifest, assets } = await loader.read(bankPath);
@@ -351,10 +363,10 @@ export class AMS {
       this.bankMemoryUsed.set(bankPath, totalBytes);
       this.bankLastActiveNs.set(bankPath, process.hrtime.bigint());
 
-      this.lifecycle = "ready";
+      this.lifecycle = priorLifecycle === "playing" || priorLifecycle === "paused" ? priorLifecycle : "ready";
       return handle;
     } catch (err) {
-      this.lifecycle = "error";
+      this.lifecycle = priorLifecycle;
       if (err instanceof AMSError) throw err;
       throw new AMSError(ErrorCodes.BANK_LOAD_FAILED, `Failed to load cue bank "${bankPath}": ${err instanceof Error ? err.message : String(err)}`, false);
     }
@@ -367,9 +379,30 @@ export class AMS {
     const bank = this.banks.get(bankPath);
     if (!bank) return;
 
-    // Evict states registered by this bank
+    const others = [...this.banks.entries()].filter(([p]) => p !== bankPath).map(([, b]) => b);
+    // Only remove registrations no other loaded bank also declares — bank
+    // load silently skips duplicates, so ownership is shared.
     for (const stateDef of bank.manifest.states) {
-      this.contextEngine.unregisterState(stateDef.name);
+      this.logicLayer.unregisterStateDefaultCue(stateDef.name);
+      if (!others.some((b) => b.manifest.states.some((s) => s.name === stateDef.name))) {
+        this.contextEngine.unregisterState(stateDef.name);
+      }
+    }
+    for (const rtpcDef of bank.manifest.rtpcs) {
+      if (!others.some((b) => b.manifest.rtpcs.some((r) => r.name === rtpcDef.name))) {
+        this.contextEngine.unregisterRtpc(rtpcDef.name);
+      }
+    }
+    this.logicLayer.unloadCues(bank.manifest.cues.map((c) => c.cueId));
+    this.logicLayer.unloadStingers(bank.manifest.stingers.map((s) => s.stingerId));
+
+    // Rebuild the transition matrix from the remaining banks.
+    const matrix = this.logicLayer.getMatrix();
+    matrix.clear();
+    for (const b of others) {
+      for (const descriptor of b.manifest.transitionMatrix) {
+        matrix.add(descriptor);
+      }
     }
 
     this.banks.delete(bankPath);
@@ -455,7 +488,7 @@ export class AMS {
       case "BAR":
         return Number(this.playbackEngine.getClock().nextBarSample());
       case "SEGMENT_END":
-        return currentSample;
+        return this.logicLayer.getSegmentEndSample() ?? currentSample;
     }
   }
 
@@ -473,8 +506,17 @@ export class AMS {
       try {
         (handler as (e: AMSEvent) => void)(event);
       } catch (err) {
-        const message = `Unhandled error in "${event.type}" handler`;
-        this.emitError("CALLBACK_ERROR", message, true);
+        if (event.type === "error") {
+          // An error handler that throws must not recurse into itself.
+          try {
+            console.error(`Unhandled error in "error" handler:`, err instanceof Error ? err : String(err));
+          } catch {
+            // Even the console must not break dispatch.
+          }
+        } else {
+          const message = `Unhandled error in "${event.type}" handler`;
+          this.emitError("CALLBACK_ERROR", message, true);
+        }
       }
     }
   }
