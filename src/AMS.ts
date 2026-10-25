@@ -101,6 +101,7 @@ export class AMS {
       clock: this.playbackEngine.getClock(),
       adapter,
       onInstruction: (instruction) => this.playbackEngine.schedule(instruction),
+      cancelPendingCueSwitches: () => this.playbackEngine.cancelPendingCueSwitches(),
       emitError: (code, message, recoverable, context) => this.emitError(code, message, recoverable, context),
       emitTransitionStart: (e) => this.dispatch(e),
       emitTransitionEnd: (from, to, elapsedMs) => this.dispatch({ type: "transition_end", fromCueId: from ?? "", toCueId: to, elapsedMs } as const),

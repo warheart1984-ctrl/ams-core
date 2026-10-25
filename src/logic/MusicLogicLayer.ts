@@ -60,6 +60,7 @@ export class MusicLogicLayer {
   private lastTransitionEndNs: bigint | null = null;
   private conditionEvaluator: (expr: string, rtpcValues: Map<string, number>) => boolean;
   private onInstruction: (instruction: PlaybackInstruction) => void;
+  private cancelPendingCueSwitches: () => void;
   private emitError: (code: string, message: string, recoverable: boolean, context?: Record<string, unknown>) => void;
   private emitTransitionStart: (e: TransitionStartEvent) => void;
   private emitTransitionEnd: (from: string | null, to: string, elapsedMs: number) => void;
@@ -71,6 +72,8 @@ export class MusicLogicLayer {
     clock: Clock;
     adapter: PlaybackAdapter;
     onInstruction: (instruction: PlaybackInstruction) => void;
+    /** Drop cue switches that are scheduled but not yet audible. */
+    cancelPendingCueSwitches?: () => void;
     emitError: (code: string, message: string, recoverable: boolean, context?: Record<string, unknown>) => void;
     emitTransitionStart: (e: TransitionStartEvent) => void;
     emitTransitionEnd: (from: string | null, to: string, elapsedMs: number) => void;
@@ -82,6 +85,7 @@ export class MusicLogicLayer {
     this.clock = deps.clock;
     this.adapter = deps.adapter;
     this.onInstruction = deps.onInstruction;
+    this.cancelPendingCueSwitches = deps.cancelPendingCueSwitches ?? (() => {});
     this.emitError = deps.emitError;
     this.emitTransitionStart = deps.emitTransitionStart;
     this.emitTransitionEnd = deps.emitTransitionEnd;
@@ -213,6 +217,20 @@ export class MusicLogicLayer {
       return;
     }
 
+    // Interruptibility guard — the in-flight transition's `interruptible`
+    // flag decides, not the incoming descriptor's. A lower-priority incoming
+    // transition cannot supersede a non-interruptible in-flight one.
+    if (this.transitionInProgress && this.transitionInProgress.descriptor.interruptible === false) {
+      if ((descriptor.priority ?? 0) < (this.transitionInProgress.descriptor.priority ?? 0)) {
+        this.emitError(
+          ErrorCodes.TRANSITION_FAILED,
+          `Transition (${prevState ?? "start"} → ${newState}) superseded: existing transition has higher priority`,
+          true
+        );
+        return;
+      }
+    }
+
     // Guards passed — only now does the state actually change.
     this.activeState = newState;
     this.scheduleTransition(descriptor, prevState, newState, targetCueId);
@@ -255,20 +273,6 @@ export class MusicLogicLayer {
 
     const crossfadeMs = descriptor.crossfadeMs ?? 0;
 
-    // Interruptibility check — the in-flight transition's `interruptible`
-    // flag decides, not the incoming descriptor's. A lower-priority incoming
-    // transition cannot supersede a non-interruptible in-flight one.
-    if (this.transitionInProgress && this.transitionInProgress.descriptor.interruptible === false) {
-      if ((descriptor.priority ?? 0) < (this.transitionInProgress.descriptor.priority ?? 0)) {
-        this.emitError(
-          ErrorCodes.TRANSITION_FAILED,
-          `Transition (${fromState ?? "start"} → ${toState}) superseded: existing transition has higher priority`,
-          true
-        );
-        return;
-      }
-    }
-
     // Stinger scheduling — only after the transition is accepted, so a
     // rejected transition never plays its stinger. (Must not precede the
     // grid boundary.)
@@ -305,7 +309,9 @@ export class MusicLogicLayer {
       // No-op: already immediate
     }
 
-    // Cue switch
+    // Cue switch — a not-yet-audible switch from an earlier transition is
+    // superseded by this one and must not land after it.
+    this.cancelPendingCueSwitches();
     this.onInstruction({
       type: "CUE_SWITCH",
       atSample: targetPosition,
@@ -376,7 +382,10 @@ export class MusicLogicLayer {
 
   /** Mark a transition as ended audibly. */
   onTransitionEnded(fromCueId: string, toCueId: string, elapsedMs: number): void {
-    this.transitionInProgress = null;
+    // A cut-short older crossfade must not clear a newer in-flight transition.
+    if (!this.transitionInProgress || this.transitionInProgress.targetCueId === toCueId) {
+      this.transitionInProgress = null;
+    }
     this.lastTransitionEndNs = this.nowNs();
     this.emitTransitionEnd(fromCueId, toCueId, elapsedMs);
   }

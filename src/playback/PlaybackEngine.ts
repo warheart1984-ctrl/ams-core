@@ -66,9 +66,15 @@ export class PlaybackEngine {
   /** Called when a dispatched crossfade completes. Wired to the logic layer. */
   onTransitionEnded?: (fromCueId: string, toCueId: string, elapsedMs: number) => void;
   /** CUE_SWITCHes handed to the adapter but not yet audible (atSample in the future). */
-  private dispatchedSwitches: { cueId: string; fromCueId: string; atSample: number; crossfadeMs: number }[] = [];
+  private dispatchedSwitches: { cueId: string; atSample: number; crossfadeMs: number }[] = [];
+  /**
+   * Logical position minus adapter output position. Adapters report a
+   * monotonic device position, so a seek moves the logical timeline
+   * without moving the output; this offset keeps the two comparable.
+   */
+  private outputOffset = 0;
   /** Audible cue switches whose crossfade has not yet completed. */
-  private pendingTransitionEnds: { fromCueId: string; toCueId: string; endSample: number; crossfadeMs: number }[] = [];
+  private pendingTransitionEnds: { fromCueId: string; toCueId: string; startSample: number; endSample: number; crossfadeMs: number }[] = [];
   private lastAudibleCueId = "";
   /** Stingers currently sounding or scheduled, with their scheduled end position (RFC §7.3). */
   private activeStingers: { stingerId: string; endSample: number }[] = [];
@@ -121,6 +127,9 @@ export class PlaybackEngine {
   }
 
   pause(): void {
+    // Catch the clock up to the output first, or the samples played since
+    // the last poll are left behind as drift for the whole pause.
+    this.tick();
     this.clock.pause(this.nowNs());
     this.adapter.pause();
   }
@@ -131,7 +140,12 @@ export class PlaybackEngine {
   }
 
   seekToSample(targetSample: number): void {
+    // Re-anchor the logical timeline to the current output position so the
+    // seek is not measured as drift and pulled back by recoverDrift.
+    const outputSample = this.adapter.getCurrentOutputSample();
     this.clock.seekToSample(BigInt(targetSample));
+    this.outputOffset = targetSample - outputSample;
+    this.lastOutputSample = outputSample;
     this.currentSample = targetSample;
     this.adapter.schedule({ type: "SEEK", atSample: targetSample });
   }
@@ -191,6 +205,15 @@ export class PlaybackEngine {
     const outputSample = this.adapter.getCurrentOutputSample();
     const delta = outputSample - this.lastOutputSample;
 
+    // While paused the musical timeline stands still. Output that still
+    // moves (e.g. an asynchronous device suspend) is absorbed into the
+    // offset rather than reported as drift.
+    if (this.clock.isPaused()) {
+      this.outputOffset -= delta;
+      this.lastOutputSample = outputSample;
+      return;
+    }
+
     // Advance logical clock
     this.clock.advance(BigInt(Math.max(0, delta)));
 
@@ -199,7 +222,9 @@ export class PlaybackEngine {
     // and fed runaway corrections into recoverDrift).
     const logical = this.clock.snapshot().sample.samples;
     this.currentSample = logical;
-    const drift = outputSample - logical;
+    // Where the audio output currently is on the logical timeline.
+    const position = outputSample + this.outputOffset;
+    const drift = position - logical;
     const toleranceSamples = Math.ceil(this.config.sampleRate * 0.001); // 1 ms
     if (Math.abs(drift) > toleranceSamples) {
       this.driftViolations++;
@@ -213,7 +238,7 @@ export class PlaybackEngine {
 
     // Compute the lookahead horizon
     const lookaheadSamples = Math.floor((this.config.lookaheadMs / 1000) * this.config.sampleRate);
-    const horizon = outputSample + lookaheadSamples;
+    const horizon = position + lookaheadSamples;
 
     // Dispatch instructions to the adapter. Past-due and IMMEDIATE entries
     // dispatch now; future entries inside the lookahead horizon are handed
@@ -223,7 +248,8 @@ export class PlaybackEngine {
     while (index < this.scheduleQueue.length) {
       const entry = this.scheduleQueue[index];
       if (entry.instruction.immediately || entry.atSample <= horizon) {
-        this.adapter.schedule(entry.instruction);
+        // Adapters schedule against their own output position.
+        this.adapter.schedule({ ...entry.instruction, atSample: entry.atSample - this.outputOffset });
         this.noteDispatched(entry.instruction);
         this.scheduleQueue.splice(index, 1);
       } else {
@@ -233,7 +259,7 @@ export class PlaybackEngine {
 
     // Promote dispatched cue switches whose audible position has arrived,
     // then report any crossfades that completed.
-    this.promoteDispatched(outputSample);
+    this.promoteDispatched(position);
 
     // Fire grid events (beat/bar) based on new logical position
     this.fireGridEventsFromOutput(outputSample);
@@ -266,6 +292,20 @@ export class PlaybackEngine {
 
   getPendingInstructionCount(): number {
     return this.scheduleQueue.length;
+  }
+
+  /**
+   * Drop every CUE_SWITCH that has not become audible yet, queued or already
+   * handed to the adapter. Called when a newer transition supersedes them,
+   * so a stale BAR-quantized switch cannot land after an IMMEDIATE one.
+   * Returns the number of switches dropped.
+   */
+  cancelPendingCueSwitches(): number {
+    const queued = this.scheduleQueue.length;
+    this.scheduleQueue = this.scheduleQueue.filter((e) => e.instruction.type !== "CUE_SWITCH");
+    const dropped = queued - this.scheduleQueue.length + this.dispatchedSwitches.length;
+    this.dispatchedSwitches = [];
+    return dropped;
   }
 
   /** Report a cue change (called by the logic layer when a switch is audible). */
@@ -353,7 +393,6 @@ export class PlaybackEngine {
     if (instruction.type === "CUE_SWITCH" && instruction.targetCueId) {
       this.dispatchedSwitches.push({
         cueId: instruction.targetCueId,
-        fromCueId: this.lastAudibleCueId,
         atSample: instruction.atSample,
         crossfadeMs: instruction.crossfadeMs ?? 0,
       });
@@ -369,17 +408,27 @@ export class PlaybackEngine {
   private promoteDispatched(outputSample: number): void {
     while (this.dispatchedSwitches.length > 0 && this.dispatchedSwitches[0].atSample <= outputSample) {
       const sw = this.dispatchedSwitches.shift()!;
+      // The previous cue is whatever was audible when this one starts, not
+      // when it was dispatched.
+      const fromCueId = this.lastAudibleCueId;
+      // A crossfade still running is cut short by the new switch: report
+      // its end now so every audible transition gets a transition_end.
+      for (const cut of this.pendingTransitionEnds.splice(0)) {
+        const elapsedMs = ((sw.atSample - cut.startSample) * 1000) / this.config.sampleRate;
+        this.onTransitionEnded?.(cut.fromCueId, cut.toCueId, Math.max(0, Math.round(elapsedMs)));
+      }
       this.lastAudibleCueId = sw.cueId;
       this.onCueStarted?.(sw.cueId, sw.atSample);
       if (sw.crossfadeMs > 0) {
         this.pendingTransitionEnds.push({
-          fromCueId: sw.fromCueId,
+          fromCueId,
           toCueId: sw.cueId,
+          startSample: sw.atSample,
           endSample: sw.atSample + (sw.crossfadeMs / 1000) * this.config.sampleRate,
           crossfadeMs: sw.crossfadeMs,
         });
       } else {
-        this.onTransitionEnded?.(sw.fromCueId, sw.cueId, 0);
+        this.onTransitionEnded?.(fromCueId, sw.cueId, 0);
       }
     }
     while (this.pendingTransitionEnds.length > 0 && this.pendingTransitionEnds[0].endSample <= outputSample) {

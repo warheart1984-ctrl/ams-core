@@ -58,6 +58,9 @@ export class NullAdapter implements PlaybackAdapter {
 
   pause(): void {
     if (this.paused) return;
+    // Freeze the reported position where output stopped (it was 0 before,
+    // which made every paused tick look like a full-length drift).
+    this.outputSample = this.getCurrentOutputSample();
     this.paused = true;
     this.pauseStartNs = process.hrtime.bigint();
   }
