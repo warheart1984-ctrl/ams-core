@@ -6,7 +6,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test": "node --test \"dist/**/*.test.js\"",
+    "test": "npm run build && node scripts/run-tests.mjs",
     "lint": "tsc --noEmit"
   },
   "devDependencies": {
