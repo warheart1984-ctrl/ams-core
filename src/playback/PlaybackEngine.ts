@@ -61,6 +61,8 @@ export class PlaybackEngine {
   /** Count of drift excursions beyond tolerance. */
   private driftViolations = 0;
   private lastCueCrossfade: { from: string; to: string; startedAtSample: number; durationSamples: number } | null = null;
+  /** Stingers currently sounding or scheduled, with their scheduled end position (RFC §7.3). */
+  private activeStingers: { stingerId: string; endSample: number }[] = [];
 
   constructor(adapter: PlaybackAdapter, config: PlaybackEngineConfig) {
     if (![44100, 48000].includes(config.sampleRate)) {
@@ -146,7 +148,14 @@ export class PlaybackEngine {
   schedule(instruction: PlaybackInstruction): void {
     if (!this.started) return;
 
-    const atSample = Math.max(0, Math.trunc(instruction.atSample));
+    let atSample = Math.max(0, Math.trunc(instruction.atSample));
+
+    // Stinger conflict policy (RFC §7.3): QUEUE waits for the active
+    // stinger to end, INTERRUPT stops it first, LAYER plays both.
+    if (instruction.type === "STINGER" && instruction.stingerId) {
+      atSample = this.resolveStingerConflict(instruction, atSample);
+      instruction = { ...instruction, atSample };
+    }
     const entry: PendingInstruction = {
       atSample,
       instruction,
@@ -329,6 +338,47 @@ export class PlaybackEngine {
     // Crossfade completion is tracked by adapter callbacks in production.
     // This method exists as an extension point for adapters that cannot
     // provide callbacks, in which case the engine times them out here.
+  }
+
+  /**
+   * Apply the stinger conflict policy and return the position the new
+   * stinger should actually play at.
+   */
+  private resolveStingerConflict(instruction: PlaybackInstruction, atSample: number): number {
+    const mode = instruction.stingerConflictMode ?? "QUEUE";
+    // Stingers ending at or before the requested position are no longer active.
+    this.activeStingers = this.activeStingers.filter((s) => s.endSample > atSample);
+
+    if (this.activeStingers.length === 0 || mode === "LAYER") {
+      this.trackActiveStinger(instruction, atSample);
+      return atSample;
+    }
+
+    if (mode === "INTERRUPT") {
+      for (const s of this.activeStingers) {
+        this.scheduleQueue.push({
+          atSample,
+          instruction: { type: "STOP", atSample, stingerId: s.stingerId },
+          seq: this.seqCounter++,
+        });
+      }
+      this.scheduleQueue.sort((a, b) => a.atSample - b.atSample || a.seq - b.seq);
+      this.activeStingers = [];
+      this.trackActiveStinger(instruction, atSample);
+      return atSample;
+    }
+
+    // QUEUE (default): wait until the last active stinger ends.
+    const position = Math.max(...this.activeStingers.map((s) => s.endSample));
+    this.trackActiveStinger(instruction, position);
+    return position;
+  }
+
+  private trackActiveStinger(instruction: PlaybackInstruction, atSample: number): void {
+    this.activeStingers.push({
+      stingerId: instruction.stingerId!,
+      endSample: atSample + (instruction.stingerDurationSamples ?? 0),
+    });
   }
 
   private emitError(code: string, message: string, recoverable: boolean, context?: Record<string, unknown>): void {
