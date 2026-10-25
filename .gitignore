@@ -2,3 +2,8 @@ node_modules/
 dist/
 **/.pytest_cache/
 **/__pycache__/
+
+# Secrets must come from the environment, never the repo (RFC §12 posture).
+.env
+.env.*
+!.env.example
