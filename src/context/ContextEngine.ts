@@ -65,6 +65,8 @@ export class ContextEngine {
   private activeStates = new Map<string, ActiveState>();
   /** States waiting to enter, keyed by exclusivity group. */
   private queuedStates = new Map<string, StateChangeRequest[]>();
+  /** Each group's active state just before its most recent change, for rollback. */
+  private priorActive = new Map<string, ActiveState | null>();
   private config: ContextEngineConfig;
   private startTimeNs: bigint = 0n;
   private eventEmitter = new EventEmitter<ContextEngineEvent>();
@@ -201,6 +203,7 @@ export class ContextEngine {
         enteredAtNs: nowNs,
         preemptedStack: [...active.preemptedStack, preempted],
       };
+      this.priorActive.set(group, active);
       this.activeStates.set(group, newActive);
       this.emitStateChangeEvent({
         type: "state",
@@ -220,6 +223,7 @@ export class ContextEngine {
       enteredAtNs: nowNs,
       preemptedStack: [],
     };
+    this.priorActive.set(group, null);
     this.activeStates.set(group, newActive);
     this.emitStateChangeEvent({
       type: "state",
@@ -254,6 +258,7 @@ export class ContextEngine {
         enteredAtNs: nowNs,
         preemptedStack: active.preemptedStack,
       };
+      this.priorActive.set(exclusivityGroup, { ...active, preemptedStack: [...active.preemptedStack, restored] });
       this.activeStates.set(exclusivityGroup, newActive);
       this.emitStateChangeEvent({
         type: "state",
@@ -277,6 +282,26 @@ export class ContextEngine {
       kind: "cancelled",
     });
     return { kind: "cancelled", cancelled: cancelledName, restored: null };
+  }
+
+  /**
+   * Undo the most recent change in `group`, provided `stateName` is still
+   * the state it entered. The facade calls this when the music logic rejects
+   * a change this engine already accepted, so the reported state never
+   * disagrees with what is playing. Emits no event: nothing audible changed.
+   * Returns true if a rollback happened.
+   */
+  revertStateChange(group: string, stateName: string): boolean {
+    const active = this.activeStates.get(group);
+    if (!active || active.definition.name !== stateName || !this.priorActive.has(group)) return false;
+    const prior = this.priorActive.get(group)!;
+    if (prior) {
+      this.activeStates.set(group, prior);
+    } else {
+      this.activeStates.delete(group);
+    }
+    this.priorActive.delete(group);
+    return true;
   }
 
   /** Drain the queued state queue for an exclusivity group. Returns any newly-entered states. */

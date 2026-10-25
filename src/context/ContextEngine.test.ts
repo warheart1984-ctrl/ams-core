@@ -166,3 +166,38 @@ test("Concurrency: simultaneous state calls with equal priority resolve determin
   assert.equal(r2.kind, "queued");
   assert.equal(engine.getActiveStateName(), "A");
 });
+test("State: revertStateChange restores the preempted state and its stack, silently", () => {
+  const engine = makeEngine();
+  registerBaseline(engine);
+  engine.setState("Exploration");
+  engine.setState("Combat");
+  const events: string[] = [];
+  engine.on("state", (e) => events.push(e.newState));
+
+  assert.equal(engine.revertStateChange("gameplay", "Combat"), true);
+  assert.equal(engine.getActiveStateName("gameplay"), "Exploration");
+  assert.equal(engine.getActiveState("gameplay")!.preemptedStack.length, 0);
+  assert.deepEqual(events, [], "a rollback must not emit a state event");
+
+  // Only the most recent change can be undone, and only once.
+  assert.equal(engine.revertStateChange("gameplay", "Exploration"), false);
+});
+
+test("State: revertStateChange of a first entry leaves the group empty", () => {
+  const engine = makeEngine();
+  registerBaseline(engine);
+  engine.setState("Exploration");
+  assert.equal(engine.revertStateChange("gameplay", "Exploration"), true);
+  assert.equal(engine.getActiveStateName("gameplay"), null);
+  // Re-entering is a fresh accept, not a re-entry.
+  assert.equal(engine.setState("Exploration").kind, "accepted");
+});
+
+test("State: revertStateChange ignores a state that is no longer active", () => {
+  const engine = makeEngine();
+  registerBaseline(engine);
+  engine.setState("Exploration");
+  engine.setState("Combat");
+  assert.equal(engine.revertStateChange("gameplay", "Exploration"), false);
+  assert.equal(engine.getActiveStateName("gameplay"), "Combat");
+});

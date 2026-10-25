@@ -204,7 +204,12 @@ export interface TransitionMatrixEntry {
 // ─── Playback Instructions ───────────────────────────────────────
 
 export interface PlaybackInstruction {
-  type: "CUE_SWITCH" | "STEM_VOLUME" | "STINGER" | "CROSSFADE" | "STOP" | "SEEK" | "PAUSE" | "RESUME";
+  /**
+   * CANCEL withdraws an earlier CUE_SWITCH (`targetCueId`) or STINGER
+   * (`stingerId`) that was dispatched for `atSample` but has not played yet,
+   * because a newer transition superseded it.
+   */
+  type: "CUE_SWITCH" | "STEM_VOLUME" | "STINGER" | "CROSSFADE" | "STOP" | "SEEK" | "PAUSE" | "RESUME" | "CANCEL";
   /** Target sample position for sample-accurate scheduling */
   atSample: number;
   /** Cue switch parameters */

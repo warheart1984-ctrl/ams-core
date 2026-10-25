@@ -453,3 +453,137 @@ test("Memory: cue activity resets the bank eviction timer (RFC §13.1)", async (
   const afterStinger = lastActive.get("testbank")!;
   assert.ok(afterStinger >= afterCue, "stinger activity must refresh last-active timestamp");
 });
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** AMS at 240 BPM (beat = 250 ms, bar = 1 s) so real-time tests stay short. */
+async function makeFastAms(manifest: CueBankManifest, pollingIntervalMs = 1): Promise<{ ams: AMS; adapter: NullAdapter }> {
+  const adapter = new NullAdapter();
+  const ams = new AMS(adapter, { sampleRate: 44100, bpm: 240, timeSignatureNumerator: 4, timeSignatureDenominator: 4, pollingIntervalMs });
+  await ams.initialize();
+  await loadBank(ams, manifest);
+  return { ams, adapter };
+}
+
+test("E2E: an IMMEDIATE transition cancels a pending BAR switch that has not played yet", { timeout: 5000 }, async () => {
+  const { ams, adapter } = await makeFastAms(buildManifest());
+  const sent: PlaybackInstruction[] = [];
+  const orig = adapter.schedule.bind(adapter);
+  adapter.schedule = (i) => { sent.push(i); orig(i); };
+  const cueEvents: string[] = [];
+  ams.on("cue_changed", (e) => cueEvents.push(e.newCueId));
+
+  ams.setState("Exploration"); // *→* BEAT: audible at 250 ms
+  await sleep(400);
+  ams.setState("Combat"); // BAR: lands at 1 s
+  ams.setState("Cutscene"); // IMMEDIATE, supersedes Combat
+  await sleep(1000); // well past the bar where Combat would have landed
+
+  assert.deepEqual(cueEvents, ["cue_exploration", "cue_cutscene"], "the superseded Combat switch must not play");
+  assert.equal(ams.getActiveCueId(), "cue_cutscene");
+  assert.equal(ams.getActiveState("gameplay"), "Cutscene");
+  // Combat's stinger was still queued: it must never reach the adapter.
+  assert.ok(!sent.some((i) => i.type === "STINGER" && i.stingerId === "stinger_combat_enter"));
+  ams.stop();
+});
+
+test("E2E: superseding after dispatch sends CANCEL to the adapter for the switch and its stinger", { timeout: 5000 }, async () => {
+  const { ams, adapter } = await makeFastAms(buildManifest());
+  const sent: PlaybackInstruction[] = [];
+  const orig = adapter.schedule.bind(adapter);
+  adapter.schedule = (i) => { sent.push(i); orig(i); };
+  const cueEvents: string[] = [];
+  ams.on("cue_changed", (e) => cueEvents.push(e.newCueId));
+
+  ams.setState("Exploration"); // audible at 250 ms
+  await sleep(400);
+  ams.setState("Combat"); // BAR at 1 s with stinger; enters the 500 ms lookahead at ~0.5 s
+  await sleep(250);
+  const stinger = sent.find((i) => i.type === "STINGER" && i.stingerId === "stinger_combat_enter");
+  const sw = sent.find((i) => i.type === "CUE_SWITCH" && i.targetCueId === "cue_combat");
+  assert.ok(stinger && sw, "Combat's stinger and switch should already be with the adapter");
+
+  ams.setState("Cutscene");
+  assert.ok(sent.some((i) => i.type === "CANCEL" && i.stingerId === "stinger_combat_enter" && i.atSample === stinger!.atSample));
+  assert.ok(sent.some((i) => i.type === "CANCEL" && i.targetCueId === "cue_combat" && i.atSample === sw!.atSample));
+
+  await sleep(700); // past the bar
+  assert.deepEqual(cueEvents, ["cue_exploration", "cue_cutscene"]);
+  ams.stop();
+});
+
+test("E2E: a rejected non-interruptible supersede leaves the logic layer's state unchanged", async () => {
+  const manifest = buildManifest();
+  manifest.transitionMatrix = [
+    { fromState: "Exploration", toState: "Combat", type: "CUE_SWITCH", quantization: "BAR", crossfadeMs: 0, interruptible: false, priority: 100 },
+    { fromState: "Combat", toState: "Cutscene", type: "CUE_SWITCH", quantization: "BEAT", crossfadeMs: 0, priority: 10 },
+    { fromState: "*", toState: "*", type: "CUE_SWITCH", quantization: "BEAT", crossfadeMs: 0 },
+  ];
+  const { ams } = await makeFastAms(manifest);
+  const errors: string[] = [];
+  ams.on("error", (e) => errors.push(e.message));
+
+  ams.setState("Exploration");
+  ams.setState("Combat"); // non-interruptible, priority 100
+  ams.setState("Cutscene"); // descriptor priority 10 → rejected
+
+  assert.ok(errors.some((m) => m.includes("superseded")), "the supersede must be rejected");
+  assert.equal(ams.getMusicLogicLayer().getActiveState(), "Combat");
+  // The context engine is rolled back too, so the two layers agree.
+  assert.equal(ams.getActiveState("gameplay"), "Combat");
+  ams.stop();
+});
+
+test("E2E: after a rolled-back rejection, retrying the state is a fresh transition", { timeout: 5000 }, async () => {
+  const manifest = buildManifest();
+  manifest.transitionMatrix = [
+    { fromState: "Exploration", toState: "Combat", type: "CUE_SWITCH", quantization: "BAR", crossfadeMs: 0, interruptible: false, priority: 100 },
+    { fromState: "*", toState: "*", type: "CUE_SWITCH", quantization: "BEAT", crossfadeMs: 0 },
+  ];
+  const { ams } = await makeFastAms(manifest);
+  const cueEvents: string[] = [];
+  ams.on("cue_changed", (e) => cueEvents.push(e.newCueId));
+
+  ams.setState("Exploration");
+  ams.setState("Combat"); // non-interruptible, lands at the 1 s bar
+  ams.setState("Cutscene"); // rejected while Combat is in flight
+  assert.equal(ams.getActiveState("gameplay"), "Combat");
+
+  await sleep(1200); // Combat lands; its transition ends
+  ams.setState("Cutscene"); // must not be swallowed as a re-entry
+  await sleep(400);
+  assert.equal(ams.getActiveState("gameplay"), "Cutscene");
+  assert.equal(ams.getActiveCueId(), "cue_cutscene");
+  assert.deepEqual(cueEvents, ["cue_combat", "cue_cutscene"]);
+  ams.stop();
+});
+
+test("E2E: seekToSample holds its position instead of being pulled back as drift", { timeout: 5000 }, async () => {
+  const { ams } = await makeFastAms(buildManifest());
+  const engine = ams.getPlaybackEngine();
+  await sleep(100);
+  engine.seekToSample(441000);
+  await sleep(200);
+
+  const position = engine.getClock().snapshot().sample.samples;
+  assert.ok(position >= 441000 && position < 441000 + 44100, `expected ~441000 + 200 ms, got ${position}`);
+  assert.equal(engine.getDriftViolations(), 0);
+  ams.stop();
+});
+
+test("E2E: pause/resume does not register drift and NullAdapter holds its paused position", { timeout: 5000 }, async () => {
+  // Default 10 ms poll: output that moved since the last tick must not be
+  // left behind as drift when the clock pauses.
+  const { ams, adapter } = await makeFastAms(buildManifest(), 10);
+  const engine = ams.getPlaybackEngine();
+  await sleep(155);
+  engine.pause();
+  const frozen = adapter.getCurrentOutputSample();
+  assert.ok(frozen > 0, "paused position must be where output stopped, not 0");
+  await sleep(200);
+  assert.equal(adapter.getCurrentOutputSample(), frozen);
+  engine.resume();
+  await sleep(150);
+
+  assert.equal(engine.getDriftViolations(), 0);
+  ams.stop();
+});

@@ -101,6 +101,8 @@ export class AMS {
       clock: this.playbackEngine.getClock(),
       adapter,
       onInstruction: (instruction) => this.playbackEngine.schedule(instruction),
+      cancelPendingCueSwitches: () => this.playbackEngine.cancelPendingCueSwitches(),
+      cancelPendingStinger: (stingerId) => this.playbackEngine.cancelPendingStinger(stingerId),
       emitError: (code, message, recoverable, context) => this.emitError(code, message, recoverable, context),
       emitTransitionStart: (e) => this.dispatch(e),
       emitTransitionEnd: (from, to, elapsedMs) => this.dispatch({ type: "transition_end", fromCueId: from ?? "", toCueId: to, elapsedMs } as const),
@@ -126,7 +128,13 @@ export class AMS {
     // Wire context engine to logic layer
     this.contextEngine.on("state", (e) => {
       if (e.kind === "accepted" || e.kind === "preempted" || e.kind === "cancelled") {
-        this.logicLayer.handleStateChange(e.prevState, e.newState);
+        const applied = this.logicLayer.handleStateChange(e.prevState, e.newState);
+        // A change the music logic rejected did not happen: roll the context
+        // back so getActiveState() matches what is playing, and a retry is a
+        // fresh transition rather than a no-op re-entry.
+        if (!applied && e.newState !== "<none>") {
+          this.contextEngine.revertStateChange(e.exclusivityGroup, e.newState);
+        }
       } else if (e.kind === "reentry") {
         // Re-entry: no-op for audio (same cue already active)
       }
