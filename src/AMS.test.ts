@@ -38,6 +38,8 @@ function buildManifest(): CueBankManifest {
     stingers: [
       { stingerId: "stinger_combat_enter", durationBars: 1, quantization: "BAR" },
       { stingerId: "stinger_boss", durationBars: 2, quantization: "IMMEDIATE", conflictMode: "INTERRUPT" },
+      { stingerId: "stinger_queue", durationBars: 1, quantization: "IMMEDIATE", conflictMode: "QUEUE" },
+      { stingerId: "stinger_layer", durationBars: 1, quantization: "IMMEDIATE", conflictMode: "LAYER" },
     ],
     transitionMatrix: [
       { fromState: "Exploration", toState: "Combat", type: "CUE_SWITCH", quantization: "BAR", crossfadeMs: 1000, stingerId: "stinger_combat_enter" },
@@ -363,6 +365,73 @@ test("Memory: pinned banks are exempt from inactivity eviction (RFC §13.1)", as
   // Pinned banks remain resident until explicitly unloaded
   ams.unloadCueBank("pinned_bank");
   assert.equal(ams.getLoadedBanks().length, 0);
+});
+
+test("Stinger conflicts: QUEUE waits for the active stinger to end (RFC §7.3)", async () => {
+  const { ams } = makeAms();
+  await ams.initialize();
+  await loadBank(ams);
+
+  const engine = ams.getPlaybackEngine() as unknown as {
+    scheduleQueue: Array<{ atSample: number; instruction: { type: string; stingerId?: string } }>;
+  };
+
+  // BAR-quantized stinger: starts at next bar (88200 @120bpm/44.1k), runs 1 bar → ends 176400.
+  ams.triggerStinger("stinger_combat_enter");
+  ams.triggerStinger("stinger_queue");
+
+  const queued = engine.scheduleQueue.find((e) => e.instruction.stingerId === "stinger_queue");
+  assert.ok(queued, "queued stinger must be scheduled, not dropped");
+  assert.equal(queued.atSample, 176400, "QUEUE waits until the active stinger's end");
+});
+
+test("Stinger conflicts: INTERRUPT stops the active stinger then plays (RFC §7.3)", async () => {
+  const { ams } = makeAms();
+  await ams.initialize();
+  await loadBank(ams);
+
+  const engine = ams.getPlaybackEngine() as unknown as {
+    scheduleQueue: Array<{ atSample: number; instruction: { type: string; stingerId?: string } }>;
+    activeStingers: Array<{ stingerId: string }>;
+  };
+
+  ams.triggerStinger("stinger_combat_enter");
+  ams.triggerStinger("stinger_boss");
+
+  const stops = engine.scheduleQueue.filter((e) => e.instruction.type === "STOP");
+  assert.equal(stops.length, 1);
+  assert.equal(stops[0].instruction.stingerId, "stinger_combat_enter");
+
+  const boss = engine.scheduleQueue.find((e) => e.instruction.stingerId === "stinger_boss");
+  assert.ok(boss);
+  // The interrupted stinger is no longer tracked; only the boss remains active.
+  assert.deepEqual(engine.activeStingers.map((s) => s.stingerId), ["stinger_boss"]);
+});
+
+test("Stinger conflicts: LAYER plays both without interrupting (RFC §7.3)", async () => {
+  const { ams } = makeAms();
+  await ams.initialize();
+  await loadBank(ams);
+
+  const engine = ams.getPlaybackEngine() as unknown as {
+    scheduleQueue: Array<{ atSample: number; instruction: { type: string; stingerId?: string } }>;
+    activeStingers: Array<{ stingerId: string }>;
+  };
+
+  ams.triggerStinger("stinger_combat_enter");
+  ams.triggerStinger("stinger_layer");
+
+  const stops = engine.scheduleQueue.filter((e) => e.instruction.type === "STOP");
+  assert.equal(stops.length, 0, "LAYER must not stop the active stinger");
+
+  const layer = engine.scheduleQueue.find((e) => e.instruction.stingerId === "stinger_layer");
+  assert.ok(layer);
+  // LAYER keeps its own resolved position (IMMEDIATE → ~sample 0), not deferred.
+  assert.ok(layer.atSample < 88200, "LAYER plays now, not after the active stinger");
+  assert.deepEqual(
+    engine.activeStingers.map((s) => s.stingerId),
+    ["stinger_combat_enter", "stinger_layer"]
+  );
 });
 
 test("Memory: cue activity resets the bank eviction timer (RFC §13.1)", async () => {

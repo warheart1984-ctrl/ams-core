@@ -16,7 +16,7 @@ import type {
   StingerDefinition,
   UnsubHandle,
 } from "./types.js";
-import { AMSError, ErrorCodes, MEMORY_PROFILE_LIMITS } from "./types.js";
+import { AMSError, ErrorCodes, MEMORY_PROFILE_LIMITS, stingerDurationSamples } from "./types.js";
 
 /**
  * AMS Facade — the public API of the Adaptive Music System.
@@ -267,12 +267,17 @@ export class AMS {
     this.bankLastActiveNs.set(bankPath!, process.hrtime.bigint());
     const stinger = bank.manifest.stingers.find((s) => s.stingerId === stingerId);
     const clock = this.playbackEngine.getClock();
-    const atSample = this.resolveStingerPosition(stinger!.quantization, clock.snapshot().sample.samples);
+    const snap = clock.snapshot();
+    const atSample = this.resolveStingerPosition(stinger!.quantization, snap.sample.samples);
     this.playbackEngine.schedule({
       type: "STINGER",
       atSample,
       stingerId,
       stingerVolume: stinger?.mixVolume ?? 1.0,
+      stingerDurationSamples: stinger
+        ? stingerDurationSamples(stinger.durationBars, snap.bpm, snap.timeSignature[0], snap.sample.sampleRate)
+        : 0,
+      stingerConflictMode: stinger?.conflictMode ?? "QUEUE",
     });
   }
 
