@@ -1,0 +1,8 @@
+HTTP/1.1 500 Internal Server Error
+Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
+Access-Control-Allow-Headers: Content-Type, Authorization, X-Client-Session-Id, X-Account-Session-Id, mcp-protocol-version, traceparent, Mcp-Session-Id
+Content-Type: application/json
+Vary: Origin
+Content-Length: 74
+Connection: close
+

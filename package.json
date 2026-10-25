@@ -1,0 +1,20 @@
+{
+  "name": "ams-core",
+  "version": "0.1.0",
+  "description": "Adaptive Music System — RFC-AMS-001 conformant implementation",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test \"dist/**/*.test.js\"",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Adaptive Music System Demo</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #101218; color: #eef1f7; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
+    main { width: min(920px, calc(100% - 32px)); padding: 32px 0; }
+    h1 { margin: 0 0 8px; font-size: 30px; } p { color: #9ea7ba; }
+    .card { background: #191d27; border: 1px solid #2c3342; border-radius: 16px; padding: 22px; margin-top: 18px; }
+    .top { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
+    .status { color: #8af0b1; font-weight: 700; } .status.off { color: #f2b36f; }
+    button { border: 0; border-radius: 9px; padding: 11px 15px; color: white; background: #5865f2; cursor: pointer; font-weight: 700; }
+    button.secondary { background: #303747; } button.danger { background: #a74358; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .controls { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+    .meter { margin-top: 24px; } label { display: flex; justify-content: space-between; margin-bottom: 8px; color: #c7cede; }
+    input[type=range] { width: 100%; accent-color: #8af0b1; }
+    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 20px; }
+    .metric { background: #11141b; border-radius: 10px; padding: 14px; } .metric small { color: #8993a8; display: block; } .metric strong { font-size: 22px; }
+    pre { height: 170px; overflow: auto; margin: 18px 0 0; padding: 14px; background: #0d0f14; border-radius: 10px; color: #a9f3c4; font-size: 12px; }
+    .hint { font-size: 13px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Adaptive Music System</h1>
+  <p>Playable proof of concept: a beat clock drives synchronized layers while state changes and RTPC values reshape the music.</p>
+  <section class="card">
+    <div class="top"><div>Engine <span id="status" class="status off">stopped</span></div><button id="start">Start audio</button></div>
+    <div class="controls">
+      <button id="explore" class="secondary" disabled>Exploration</button>
+      <button id="combat" disabled>Combat</button>
+      <button id="stinger" class="danger" disabled>Trigger stinger</button>
+    </div>
+    <div class="meter"><label><span>Replace vocal layer</span><span class="hint">WAV, MP3, or OGG</span></label><input id="vocalFile" type="file" accept="audio/*" disabled /></div>
+    <div class="meter"><label><span>Generate a vocal</span><span class="hint">provider</span></label><select id="provider"><option value="local">Local Lemonade / ACE-Step</option><option value="huggingface">Hugging Face Space</option><option value="cloud">ACE-Step Cloud</option></select><input id="lyrics" value="Rise with the night, carry us higher" /><button id="generate" class="secondary" disabled>Generate vocal</button></div>
+    <div class="meter"><label><span>Tension RTPC</span><strong id="tensionValue">0%</strong></label><input id="tension" type="range" min="0" max="100" value="0" disabled /></div>
+    <div class="grid"><div class="metric"><small>State</small><strong id="state">—</strong></div><div class="metric"><small>Beat</small><strong id="beat">—</strong></div><div class="metric"><small>Bar</small><strong id="bar">—</strong></div><div class="metric"><small>Active layers</small><strong id="layers">0</strong></div></div>
+    <pre id="log">Waiting for audio permission…</pre>
+    <p class="hint">Transitions are quantized to the next bar. Tension continuously fades percussion and adds a high-intensity layer at 75%.</p>
+  </section>
+</main>
+<script>
+const bpm = 120, beatSeconds = 60 / bpm, barBeats = 4;
+let ctx, timer, state = 'Exploration', tension = 0, beat = 0, bar = 0, nextBarState = null;
+const voices = new Map(), $ = id => document.getElementById(id), log = msg => { $('log').textContent = `[${new Date().toLocaleTimeString()}] ${msg}\n` + $('log').textContent.slice(0, 2500); };
+function voice(name, frequency, gain) { const osc = ctx.createOscillator(), g = ctx.createGain(); osc.type = name === 'pulse' ? 'square' : 'sine'; osc.frequency.value = frequency; g.gain.value = 0; osc.connect(g).connect(ctx.destination); osc.start(); voices.set(name, { osc, g, base: gain }); return voices.get(name); }
+function setLayer(name, value, ms=300) { const v = voices.get(name); if (!v) return; const now = ctx.currentTime; v.g.gain.cancelScheduledValues(now); v.g.gain.linearRampToValueAtTime(v.base * value, now + ms/1000); }
+function updateLayers() { const combat = state === 'Combat'; setLayer('pad', combat ? .32 : .24); setLayer('bass', combat ? .30 : .10); setLayer('pulse', combat ? .14 + tension*.22 : 0); setLayer('high', tension >= .75 ? (tension-.75)*.9 : 0, 500); setLayer('voice', tension >= .55 ? (tension-.55)*1.1 : 0, 800); $('layers').textContent = ['pad',combat?'bass':null,combat&&tension>0?'pulse':null,tension>=.75?'high':null,tension>=.55?'voice':null].filter(Boolean).length; }
+function switchState(next) { if (next === state) return; nextBarState = next; log(`StateChange requested: ${state} → ${next}; scheduled for next bar`); }
+async function loadStem(id, file, base) { const data=await fetch(file).then(r=>r.arrayBuffer()), buffer=await ctx.decodeAudioData(data); installStem(id,buffer,base); }
+function installStem(id, buffer, base) { const old=voices.get(id); if(old) try { old.osc.stop(); } catch {} const src=ctx.createBufferSource(), g=ctx.createGain(); src.buffer=buffer; src.loop=true; g.gain.value=0; src.connect(g).connect(ctx.destination); src.start(); voices.set(id,{osc:src,g,base}); }
+function tick() { beat++; const now=ctx.currentTime; const click=ctx.createOscillator(), cg=ctx.createGain(); click.frequency.value = beat % barBeats === 0 ? 110 : 220; cg.gain.setValueAtTime(beat % barBeats === 0 ? .22 : .09, now); cg.gain.exponentialRampToValueAtTime(.001, now+.12); click.connect(cg).connect(ctx.destination); click.start(now); click.stop(now+.13); $('beat').textContent = beat % barBeats || 4; if (beat % barBeats === 0) { bar++; $('bar').textContent = bar; if (nextBarState) { const old=state; state=nextBarState; nextBarState=null; $('state').textContent=state; log(`Bar boundary: transition completed ${old} → ${state}`); updateLayers(); } } }
+$('start').onclick = async () => { ctx = new (window.AudioContext || window.webkitAudioContext)(); await ctx.resume(); await Promise.all([loadStem('pad','audio/exploration.wav',.32),loadStem('bass','audio/combat.wav',.30),loadStem('pulse','audio/intensity.wav',.22),loadStem('high','audio/intensity.wav',.18),loadStem('voice','audio/voice.wav',.16)]); state='Exploration'; beat=0; bar=0; $('state').textContent=state; $('status').textContent='running'; $('status').className='status'; $('start').disabled=true; for (const id of ['explore','combat','stinger','tension','vocalFile']) $(id).disabled=false; updateLayers(); log('Audio started with original WAV stems at 120 BPM, 4/4.'); timer=setInterval(tick, beatSeconds*1000); };
+$('vocalFile').onchange = async e => { const file=e.target.files[0]; if(!file || !ctx) return; try { const buffer=await ctx.decodeAudioData(await file.arrayBuffer()); installStem('voice',buffer,.18); updateLayers(); log(`Vocal layer replaced with ${file.name}. It will follow the tension RTPC.`); } catch { log('Could not decode that vocal file. Try WAV, MP3, or OGG.'); } };
+$('generate').onclick = async () => { const button=$('generate'); const provider=$('provider').value; button.disabled=true; button.textContent='Generating…'; try { if(provider==='huggingface'){ window.open('https://ace-step-ace-step.hf.space/','_blank'); log('Hugging Face ACE-Step opened. Generate there, then use Upload vocal to bring the WAV into this studio.'); return; } if(provider==='cloud'){ window.open('https://acestep.io/','_blank'); log('ACE-Step Cloud opened. Generate there, download the WAV, then use Upload vocal to bring it into this studio.'); return; } const response=await fetch('http://127.0.0.1:8020/v1/audio/generations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'ACE-Step-Music',prompt:'epic rock, cinematic thunder, glitch electronic elements, swaggering male vocals, 120 BPM',lyrics:$('lyrics').value,vocal_language:'en',duration:8,response_format:'wav'})}); if(!response.ok) throw new Error(`Lemonade returned ${response.status}`); const buffer=await ctx.decodeAudioData(await response.arrayBuffer()); installStem('voice',buffer,.18); updateLayers(); log('Local Lemonade generated a new vocal layer and loaded it into the engine.'); } catch(err) { log(`${provider} unavailable: ${err.message}. Use Hugging Face or ACE-Step Cloud from the provider selector.`); } finally { button.disabled=false; button.textContent='Generate vocal'; } };
+setInterval(() => { if ($('status').textContent === 'running') $('generate').disabled = false; }, 250);
+$('explore').onclick=()=>switchState('Exploration'); $('combat').onclick=()=>switchState('Combat'); $('tension').oninput=e=>{ tension=Number(e.target.value)/100; $('tensionValue').textContent=e.target.value+'%'; updateLayers(); log(`RTPC tension = ${e.target.value}%`); }; $('stinger').onclick=()=>{ const o=ctx.createOscillator(),g=ctx.createGain(),now=ctx.currentTime; o.type='sawtooth'; o.frequency.setValueAtTime(330,now); o.frequency.exponentialRampToValueAtTime(990,now+.35); g.gain.setValueAtTime(.25,now); g.gain.exponentialRampToValueAtTime(.001,now+.6); o.connect(g).connect(ctx.destination); o.start(now); o.stop(now+.6); log('Stinger injected immediately on dedicated overlay voice.'); };
+</script>
+</body>
+</html>
