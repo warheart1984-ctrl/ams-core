@@ -71,6 +71,10 @@ export class WwiseAdapter implements PlaybackAdapter {
       case "STOP":
         // AK::SoundEngine::StopAll(gameObjectId)
         break;
+      case "CANCEL":
+        // Withdraw a not-yet-played event posted for atSample:
+        // AK::SoundEngine::StopPlayingID(playingId) for the matching post.
+        break;
       case "PAUSE":
       case "RESUME":
       case "SEEK":

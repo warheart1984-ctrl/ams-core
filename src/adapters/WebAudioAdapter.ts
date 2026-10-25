@@ -22,6 +22,8 @@ export class WebAudioAdapter implements PlaybackAdapter {
   private sampleRate = 48000;
   private buffers = new Map<string, AudioBuffer>();
   private activeSources = new Set<AudioBufferSourceNode>();
+  /** Stinger sources keyed by `${stingerId}@${atSample}`, so a CANCEL can stop them before they sound. */
+  private stingerSources = new Map<string, AudioBufferSourceNode>();
   private masterGain: GainNode | null = null;
   private stemGains = new Map<string, GainNode>();
   private stingerBus: GainNode | null = null;
@@ -84,7 +86,25 @@ export class WebAudioAdapter implements PlaybackAdapter {
         if (!this.stingerBus) break;
         const buffer = this.buffers.get(instruction.stingerId ?? "");
         if (!buffer) break; // Buffer not loaded; adapter logs via caller
-        this.playBuffer(buffer, instruction.atSample, instruction.stingerVolume ?? 1.0, this.stingerBus);
+        const src = this.playBuffer(buffer, instruction.atSample, instruction.stingerVolume ?? 1.0, this.stingerBus);
+        if (src) {
+          const key = `${instruction.stingerId}@${instruction.atSample}`;
+          this.stingerSources.set(key, src);
+          src.addEventListener("ended", () => this.stingerSources.delete(key));
+        }
+        break;
+      }
+      case "CANCEL": {
+        // Cue switches carry no audio in this adapter yet; only stingers
+        // have scheduled sources to withdraw.
+        if (!instruction.stingerId) break;
+        const key = `${instruction.stingerId}@${instruction.atSample}`;
+        const src = this.stingerSources.get(key);
+        if (src) {
+          try { src.stop(); } catch { /* already stopped */ }
+          this.stingerSources.delete(key);
+          this.activeSources.delete(src);
+        }
         break;
       }
       case "STOP":
@@ -159,9 +179,9 @@ export class WebAudioAdapter implements PlaybackAdapter {
     return this.ctx?.currentTime ?? 0;
   }
 
-  private playBuffer(buffer: AudioBuffer, atSample: number, volume: number, dest: AudioNode): void {
+  private playBuffer(buffer: AudioBuffer, atSample: number, volume: number, dest: AudioNode): AudioBufferSourceNode | null {
     const ctx = this.ctx;
-    if (!ctx) return;
+    if (!ctx) return null;
     const src = ctx.createBufferSource();
     src.buffer = buffer;
     const gain = ctx.createGain();
@@ -172,5 +192,6 @@ export class WebAudioAdapter implements PlaybackAdapter {
     src.start(when);
     this.activeSources.add(src);
     src.onended = () => this.activeSources.delete(src);
+    return src;
   }
 }

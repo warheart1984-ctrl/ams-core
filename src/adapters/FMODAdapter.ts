@@ -63,6 +63,9 @@ export class FMODAdapter implements PlaybackAdapter {
       case "STINGER":
         // Play a one-shot FMOD event on a separate channel group.
         break;
+      case "CANCEL":
+        // Release the not-yet-started event instance scheduled for atSample.
+        break;
       case "STOP":
       case "PAUSE":
       case "RESUME":

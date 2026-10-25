@@ -77,7 +77,9 @@ export class PlaybackEngine {
   private pendingTransitionEnds: { fromCueId: string; toCueId: string; startSample: number; endSample: number; crossfadeMs: number }[] = [];
   private lastAudibleCueId = "";
   /** Stingers currently sounding or scheduled, with their scheduled end position (RFC §7.3). */
-  private activeStingers: { stingerId: string; endSample: number }[] = [];
+  private activeStingers: { stingerId: string; startSample: number; endSample: number }[] = [];
+  /** STINGERs handed to the adapter but not yet sounding. */
+  private dispatchedStingers: { stingerId: string; atSample: number }[] = [];
 
   constructor(adapter: PlaybackAdapter, config: PlaybackEngineConfig) {
     if (![44100, 48000].includes(config.sampleRate)) {
@@ -304,7 +306,34 @@ export class PlaybackEngine {
     const queued = this.scheduleQueue.length;
     this.scheduleQueue = this.scheduleQueue.filter((e) => e.instruction.type !== "CUE_SWITCH");
     const dropped = queued - this.scheduleQueue.length + this.dispatchedSwitches.length;
+    // The adapter already holds these; tell it to withdraw them.
+    for (const sw of this.dispatchedSwitches) {
+      this.adapter.schedule({ type: "CANCEL", atSample: sw.atSample - this.outputOffset, targetCueId: sw.cueId });
+    }
     this.dispatchedSwitches = [];
+    return dropped;
+  }
+
+  /**
+   * Drop every instance of `stingerId` that has not started sounding yet,
+   * queued or already handed to the adapter, and release its slot in the
+   * conflict tracking. A stinger that is already sounding plays out.
+   * Returns the number of instances dropped.
+   */
+  cancelPendingStinger(stingerId: string): number {
+    const queued = this.scheduleQueue.length;
+    this.scheduleQueue = this.scheduleQueue.filter(
+      (e) => !(e.instruction.type === "STINGER" && e.instruction.stingerId === stingerId)
+    );
+    let dropped = queued - this.scheduleQueue.length;
+    this.dispatchedStingers = this.dispatchedStingers.filter((s) => {
+      if (s.stingerId !== stingerId) return true;
+      this.adapter.schedule({ type: "CANCEL", atSample: s.atSample - this.outputOffset, stingerId });
+      dropped++;
+      return false;
+    });
+    const now = this.clock.snapshot().sample.samples;
+    this.activeStingers = this.activeStingers.filter((s) => s.stingerId !== stingerId || s.startSample <= now);
     return dropped;
   }
 
@@ -390,6 +419,9 @@ export class PlaybackEngine {
 
   /** Track a dispatched CUE_SWITCH so its audible start/end can be reported. */
   private noteDispatched(instruction: PlaybackInstruction): void {
+    if (instruction.type === "STINGER" && instruction.stingerId) {
+      this.dispatchedStingers.push({ stingerId: instruction.stingerId, atSample: instruction.atSample });
+    }
     if (instruction.type === "CUE_SWITCH" && instruction.targetCueId) {
       this.dispatchedSwitches.push({
         cueId: instruction.targetCueId,
@@ -406,6 +438,8 @@ export class PlaybackEngine {
    * its transition ends once output passes position + crossfade duration.
    */
   private promoteDispatched(outputSample: number): void {
+    // Stingers that have started sounding can no longer be cancelled.
+    this.dispatchedStingers = this.dispatchedStingers.filter((s) => s.atSample > outputSample);
     while (this.dispatchedSwitches.length > 0 && this.dispatchedSwitches[0].atSample <= outputSample) {
       const sw = this.dispatchedSwitches.shift()!;
       // The previous cue is whatever was audible when this one starts, not
@@ -474,6 +508,7 @@ export class PlaybackEngine {
   private trackActiveStinger(instruction: PlaybackInstruction, atSample: number): void {
     this.activeStingers.push({
       stingerId: instruction.stingerId!,
+      startSample: atSample,
       endSample: atSample + (instruction.stingerDurationSamples ?? 0),
     });
   }

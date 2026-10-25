@@ -465,7 +465,10 @@ async function makeFastAms(manifest: CueBankManifest, pollingIntervalMs = 1): Pr
 }
 
 test("E2E: an IMMEDIATE transition cancels a pending BAR switch that has not played yet", { timeout: 5000 }, async () => {
-  const { ams } = await makeFastAms(buildManifest());
+  const { ams, adapter } = await makeFastAms(buildManifest());
+  const sent: PlaybackInstruction[] = [];
+  const orig = adapter.schedule.bind(adapter);
+  adapter.schedule = (i) => { sent.push(i); orig(i); };
   const cueEvents: string[] = [];
   ams.on("cue_changed", (e) => cueEvents.push(e.newCueId));
 
@@ -478,6 +481,33 @@ test("E2E: an IMMEDIATE transition cancels a pending BAR switch that has not pla
   assert.deepEqual(cueEvents, ["cue_exploration", "cue_cutscene"], "the superseded Combat switch must not play");
   assert.equal(ams.getActiveCueId(), "cue_cutscene");
   assert.equal(ams.getActiveState("gameplay"), "Cutscene");
+  // Combat's stinger was still queued: it must never reach the adapter.
+  assert.ok(!sent.some((i) => i.type === "STINGER" && i.stingerId === "stinger_combat_enter"));
+  ams.stop();
+});
+
+test("E2E: superseding after dispatch sends CANCEL to the adapter for the switch and its stinger", { timeout: 5000 }, async () => {
+  const { ams, adapter } = await makeFastAms(buildManifest());
+  const sent: PlaybackInstruction[] = [];
+  const orig = adapter.schedule.bind(adapter);
+  adapter.schedule = (i) => { sent.push(i); orig(i); };
+  const cueEvents: string[] = [];
+  ams.on("cue_changed", (e) => cueEvents.push(e.newCueId));
+
+  ams.setState("Exploration"); // audible at 250 ms
+  await sleep(400);
+  ams.setState("Combat"); // BAR at 1 s with stinger; enters the 500 ms lookahead at ~0.5 s
+  await sleep(250);
+  const stinger = sent.find((i) => i.type === "STINGER" && i.stingerId === "stinger_combat_enter");
+  const sw = sent.find((i) => i.type === "CUE_SWITCH" && i.targetCueId === "cue_combat");
+  assert.ok(stinger && sw, "Combat's stinger and switch should already be with the adapter");
+
+  ams.setState("Cutscene");
+  assert.ok(sent.some((i) => i.type === "CANCEL" && i.stingerId === "stinger_combat_enter" && i.atSample === stinger!.atSample));
+  assert.ok(sent.some((i) => i.type === "CANCEL" && i.targetCueId === "cue_combat" && i.atSample === sw!.atSample));
+
+  await sleep(700); // past the bar
+  assert.deepEqual(cueEvents, ["cue_exploration", "cue_cutscene"]);
   ams.stop();
 });
 
@@ -498,6 +528,32 @@ test("E2E: a rejected non-interruptible supersede leaves the logic layer's state
 
   assert.ok(errors.some((m) => m.includes("superseded")), "the supersede must be rejected");
   assert.equal(ams.getMusicLogicLayer().getActiveState(), "Combat");
+  // The context engine is rolled back too, so the two layers agree.
+  assert.equal(ams.getActiveState("gameplay"), "Combat");
+  ams.stop();
+});
+
+test("E2E: after a rolled-back rejection, retrying the state is a fresh transition", { timeout: 5000 }, async () => {
+  const manifest = buildManifest();
+  manifest.transitionMatrix = [
+    { fromState: "Exploration", toState: "Combat", type: "CUE_SWITCH", quantization: "BAR", crossfadeMs: 0, interruptible: false, priority: 100 },
+    { fromState: "*", toState: "*", type: "CUE_SWITCH", quantization: "BEAT", crossfadeMs: 0 },
+  ];
+  const { ams } = await makeFastAms(manifest);
+  const cueEvents: string[] = [];
+  ams.on("cue_changed", (e) => cueEvents.push(e.newCueId));
+
+  ams.setState("Exploration");
+  ams.setState("Combat"); // non-interruptible, lands at the 1 s bar
+  ams.setState("Cutscene"); // rejected while Combat is in flight
+  assert.equal(ams.getActiveState("gameplay"), "Combat");
+
+  await sleep(1200); // Combat lands; its transition ends
+  ams.setState("Cutscene"); // must not be swallowed as a re-entry
+  await sleep(400);
+  assert.equal(ams.getActiveState("gameplay"), "Cutscene");
+  assert.equal(ams.getActiveCueId(), "cue_cutscene");
+  assert.deepEqual(cueEvents, ["cue_combat", "cue_cutscene"]);
   ams.stop();
 });
 
