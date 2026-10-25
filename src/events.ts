@@ -12,6 +12,12 @@ import type { AMSEvent, EventHandler, UnsubHandle } from "./types.js";
 export class EventEmitter<T extends { type: string } = AMSEvent> {
   private handlers = new Map<string, Set<(event: T) => void>>();
 
+  /**
+   * @param logger Sink for handler failures when no `error` listener is
+   *   registered. Defaults to `console`.
+   */
+  constructor(private readonly logger: Pick<Console, "error"> = console) {}
+
   on<K extends T["type"]>(type: K, handler: (event: Extract<T, { type: K }>) => void): UnsubHandle {
     let set = this.handlers.get(type);
     if (!set) {
@@ -34,8 +40,9 @@ export class EventEmitter<T extends { type: string } = AMSEvent> {
       try {
         handler(event);
       } catch (err) {
-        // Emit an error event if possible; otherwise swallow.
-        // Errors in user callbacks must not break the audio pipeline.
+        // Errors in user callbacks must not break the audio pipeline. Prefer
+        // the `error` event channel; with no listener, surface via the logger
+        // rather than dropping the failure silently.
         const errorSet = this.handlers.get("error" as T["type"]);
         if (errorSet && errorSet.size > 0) {
           for (const errorHandler of [...errorSet]) {
@@ -50,6 +57,15 @@ export class EventEmitter<T extends { type: string } = AMSEvent> {
             } catch {
               // Swallow recursive errors
             }
+          }
+        } else {
+          try {
+            this.logger.error(
+              `Unhandled error in ${event.type} handler:`,
+              err instanceof Error ? err : String(err)
+            );
+          } catch {
+            // A logger that throws must not break the pipeline either.
           }
         }
       }
