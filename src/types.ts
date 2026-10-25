@@ -80,19 +80,29 @@ export function evaluateMapping(fn: MappingFunction, x: number): number {
     case "THRESHOLD":
       return clamped >= fn.threshold ? 1.0 : 0.0;
     case "CURVE": {
-      // Simple cubic bezier evaluation
+      // Bezier over the control points' ordinates: B(t) = Σ C(n,i) t^i (1-t)^(n-i) y_i,
+      // evaluated at t = clamped input (RFC §7.1: f(x) = evaluate_bezier(points, x)).
+      // B(0) = y₀ and B(1) = yₙ exactly; a monotone control polygon yields a
+      // monotone curve. Intermediate points' x positions act as shape handles.
       const pts = fn.points;
-      if (pts.length < 2) return clamped;
-      // Find the two control points we're between
-      let i = 0;
-      while (i < pts.length - 1 && pts[i + 1].x <= clamped) i++;
-      if (i >= pts.length - 1) return pts[pts.length - 1].y;
-      const p0 = pts[i];
-      const p1 = pts[i + 1];
-      const t = (clamped - p0.x) / (p1.x - p0.x);
-      return p0.y + t * (p1.y - p0.y);
+      if (pts.length === 0) return clamped;
+      if (pts.length === 1) return pts[0].y;
+      const n = pts.length - 1;
+      let y = 0;
+      for (let i = 0; i <= n; i++) {
+        y += bernstein(n, i, clamped) * pts[i].y;
+      }
+      return y;
     }
   }
+}
+
+/** Bernstein basis polynomial B(i,n)(t) = C(n,i) t^i (1-t)^(n-i). */
+function bernstein(n: number, i: number, t: number): number {
+  // Binomial coefficient via multiplicative recurrence (no factorial overflow).
+  let coeff = 1;
+  for (let k = 0; k < i; k++) coeff = (coeff * (n - k)) / (k + 1);
+  return coeff * Math.pow(1 - t, n - i) * Math.pow(t, i);
 }
 
 // ─── Stems / Layering ────────────────────────────────────────────
