@@ -199,6 +199,69 @@ test("Integration: event model emits cue_changed / transition_start / transition
   assert.equal((cueChanged as CueChangedEvent).newCueId, "cue_exploration");
 });
 
+test("E2E: real tick() drives cue_changed, activeCueId and stem mapping with no manual callbacks", { timeout: 5000 }, async () => {
+  const { ams, instructions, adapter } = makeAms();
+  const dispatched: PlaybackInstruction[] = [];
+  const origSchedule = adapter.schedule.bind(adapter);
+  adapter.schedule = (i) => { dispatched.push(i); origSchedule(i); };
+  await ams.initialize();
+  await loadBank(ams);
+
+  const cueEvents: string[] = [];
+  ams.on("cue_changed", (e) => cueEvents.push(e.newCueId));
+
+  // Combat from a cold start → fallback *→* BEAT: audible at ~0.5 s of output.
+  ams.setState("Combat");
+  // NullAdapter advances output in real time; wait past the first beat.
+  await new Promise((r) => setTimeout(r, 900));
+
+  assert.deepEqual(cueEvents, ["cue_combat"], "engine must report the audible cue start itself");
+  assert.equal(ams.getActiveCueId(), "cue_combat");
+
+  // The instruction actually reached the adapter — due entries are no longer dropped.
+  assert.ok(dispatched.some((i) => i.type === "CUE_SWITCH" && i.targetCueId === "cue_combat"));
+
+  // With an active cue, RTPC→stem mapping now runs.
+  instructions.length = 0;
+  ams.setRTPC("tension", 0.5, 0);
+  assert.ok(instructions.some((i) => i.type === "STEM_VOLUME" && i.stemId === "percussion"));
+
+  ams.stop();
+});
+
+test("E2E: a failed bank load does not brick the engine", async () => {
+  const { ams } = makeAms();
+  await ams.initialize();
+  await loadBank(ams);
+  ams.setState("Exploration");
+
+  const bad = buildManifest();
+  bad.checksums = { "missing.ogg": "a".repeat(64) };
+  await assert.rejects(() => ams.loadCueBank("bad", { read: async () => ({ manifest: bad, assets: new Map() }) }));
+
+  // Lifecycle is restored, not stuck at "error".
+  assert.notEqual(ams.getLifecycle(), "error");
+  ams.setState("Combat"); // still accepted
+  ams.stop();
+});
+
+test("E2E: an error handler that throws does not recurse", async () => {
+  const { ams } = makeAms();
+  await ams.initialize();
+  await loadBank(ams);
+  const logs: unknown[] = [];
+  const origErr = console.error;
+  console.error = (...a: unknown[]) => { logs.push(a); };
+  try {
+    ams.on("error", () => { throw new Error("error handler exploded"); });
+    ams.triggerStinger("stinger_missing"); // emits error event into the throwing handler
+  } finally {
+    console.error = origErr;
+  }
+  assert.ok(logs.length >= 1, "failure should reach console, not recurse");
+  ams.stop();
+});
+
 test("Security: malformed bank rejects checksum validation", async () => {
   const { ams } = makeAms();
   await ams.initialize();
