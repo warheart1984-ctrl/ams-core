@@ -141,6 +141,16 @@ export interface StingerDefinition {
   duckAmount?: number;
 }
 
+/** Duration of a stinger in output samples: bars × beats/bar × samples/beat. */
+export function stingerDurationSamples(
+  durationBars: number,
+  bpm: number,
+  beatsPerBar: number,
+  sampleRate: number
+): number {
+  return Math.round(durationBars * beatsPerBar * (60 / bpm) * sampleRate);
+}
+
 // ─── Transitions ─────────────────────────────────────────────────
 
 export type QuantizationMode = "IMMEDIATE" | "BEAT" | "BAR" | "SEGMENT_END";
@@ -198,6 +208,10 @@ export interface PlaybackInstruction {
   /** Stinger parameters */
   stingerId?: string;
   stingerVolume?: number;
+  /** Duration in output samples, so the engine can track when a stinger ends. */
+  stingerDurationSamples?: number;
+  /** Conflict policy when another stinger is active (RFC §7.3). Default QUEUE. */
+  stingerConflictMode?: StingerConflictMode;
   /** General */
   immediately?: boolean;
 }

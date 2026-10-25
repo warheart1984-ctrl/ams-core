@@ -1,4 +1,4 @@
-import { evaluateMapping } from "../types.js";
+import { evaluateMapping, stingerDurationSamples } from "../types.js";
 import type {
   CueDefinition,
   CueChangedEvent,
@@ -245,6 +245,13 @@ export class MusicLogicLayer {
           atSample: atPosition,
           stingerId: descriptor.stingerId,
           stingerVolume: descriptor.stingerVolume ?? stinger.mixVolume ?? 1.0,
+          stingerDurationSamples: stingerDurationSamples(
+            stinger.durationBars,
+            clockSnapshot.bpm,
+            clockSnapshot.timeSignature[0],
+            clockSnapshot.sample.sampleRate
+          ),
+          stingerConflictMode: stinger.conflictMode ?? "QUEUE",
         });
       }
     }
